@@ -69,7 +69,7 @@ def _save_json(path: str, data: dict):
         json.dump(data, f, indent=2)
 
 
-def generate_api_key(tier: Tier, customer_name: str) -> str:
+def generate_api_key(tier: Tier, customer_name: str, stripe_customer: str = "", stripe_session_id: str = "") -> str:
     """Generate a new API key for a customer. Run manually to onboard customers."""
     raw = f"meok_{tier.value}_{customer_name}_{time.time()}"
     key = f"meok_{hashlib.sha256(raw.encode()).hexdigest()[:32]}"
@@ -78,6 +78,8 @@ def generate_api_key(tier: Tier, customer_name: str) -> str:
     keys[key] = {
         "tier": tier.value,
         "customer": customer_name,
+        "stripe_customer": stripe_customer,
+        "stripe_session_id": stripe_session_id,
         "created": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "active": True,
     }
@@ -86,18 +88,33 @@ def generate_api_key(tier: Tier, customer_name: str) -> str:
 
 
 def get_tier_from_api_key(api_key: str) -> Tier:
-    """Look up tier for an API key."""
+    """Look up tier for an API key. Optionally re-validate against Stripe."""
     if not api_key:
         return Tier.FREE
     
     keys = _load_json(KEYS_FILE)
-    if api_key in keys and keys[api_key].get("active", True):
-        try:
-            return Tier(keys[api_key]["tier"])
-        except ValueError:
-            return Tier.FREE
+    record = keys.get(api_key)
+    if not record or not record.get("active", True):
+        return Tier.FREE
     
-    return Tier.FREE
+    local_tier = Tier(record["tier"]) if record.get("tier") in [t.value for t in Tier] else Tier.FREE
+    
+    # If linked to Stripe, re-validate tier no more than once per 5 minutes
+    stripe_customer = record.get("stripe_customer")
+    if stripe_customer:
+        try:
+            from stripe_tier_checker import check_stripe_tier
+            live_tier_str = check_stripe_tier(customer_email="", api_key=api_key)
+            if live_tier_str and live_tier_str in [t.value for t in Tier]:
+                live_tier = Tier(live_tier_str)
+                if live_tier != local_tier:
+                    record["tier"] = live_tier.value
+                    _save_json(KEYS_FILE, keys)
+                return live_tier
+        except Exception:
+            pass
+    
+    return local_tier
 
 
 def check_access(api_key: str = "", framework: str = None) -> Tuple[bool, str, Tier]:
