@@ -12,6 +12,7 @@ Changes from original:
 """
 
 import os
+import sys
 import json
 import hashlib
 import time
@@ -45,6 +46,18 @@ PRICE_TO_TIER = {
     "price_sovereign_1999": Tier.ENTERPRISE,
     "price_healthcare_1299": Tier.ENTERPRISE,
     "price_everything_2499": Tier.ENTERPRISE,
+    "price_1TUKOtQvIueK5XpbLsnE5vJ5": Tier.STARTER,
+    "price_1TUKPtQvIueK5XpbLsnE5vJ5": Tier.STARTER,
+    "price_1TUKOuQvIueK5XpbU2uVM87H": Tier.PROFESSIONAL,
+    "price_1TUKPuQvIueK5XpbU2uVM87H": Tier.PROFESSIONAL,
+    "price_1TUKOvQvIueK5XpbaANgKzER": Tier.PROFESSIONAL,
+    "price_1TUKPvQvIueK5XpbaANgKzER": Tier.PROFESSIONAL,
+    "price_1TUKOvQvIueK5Xpbx2PspAy6": Tier.ENTERPRISE,
+    "price_1TUKPvQvIueK5Xpbx2PspAy6": Tier.ENTERPRISE,
+    "price_1TUKOwQvIueK5XpbM8AtgSxg": Tier.PROFESSIONAL,
+    "price_1TUKPwQvIueK5XpbM8AtgSxg": Tier.PROFESSIONAL,
+    "price_1TUKOwQvIueK5XpbVLs5ZbCU": Tier.PROFESSIONAL,
+    "price_1TUKPwQvIueK5XpbVLs5ZbCU": Tier.PROFESSIONAL,
     "prod_UKQOd7kQbSgGSn": Tier.PROFESSIONAL,
     "prod_UKQOhyme5WL6uV": Tier.PROFESSIONAL,
     "prod_UKQOHuvpFVoOeE": Tier.STARTER,
@@ -100,10 +113,8 @@ def _cleanup_idempotency():
 
 def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
     if not secret:
-        logger.warning(
-            "STRIPE_WEBHOOK_SECRET not set - skipping verification (DEV MODE)"
-        )
-        return True
+        logger.error("STRIPE_WEBHOOK_SECRET not set — REJECTING unverified webhook. Set STRIPE_WEBHOOK_SECRET in production.")
+        return False
 
     if not sig_header:
         logger.error("Missing Stripe-Signature header")
@@ -180,19 +191,30 @@ def handle_checkout_completed(event_data: dict) -> dict:
     )
 
     delivery_file = os.path.expanduser("~/.meok/pending_key_delivery.jsonl")
+    delivery_entry = {
+        "email": customer_email,
+        "api_key": api_key,
+        "tier": tier.value,
+        "delivered": False,
+        "customer_name": customer_name,
+        "created_at": datetime.utcnow().isoformat(),
+    }
     with open(delivery_file, "a") as f:
-        f.write(
-            json.dumps(
-                {
-                    "email": customer_email,
-                    "api_key": api_key,
-                    "tier": tier.value,
-                    "delivered": False,
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-            )
-            + "\n"
-        )
+        f.write(json.dumps(delivery_entry) + "\n")
+
+    try:
+        from key_delivery_daemon import send_welcome_email
+        email_sent = send_welcome_email(customer_email, api_key, tier.value, customer_name)
+        if email_sent:
+            delivery_entry["delivered"] = True
+            delivery_entry["delivered_at"] = datetime.utcnow().isoformat()
+            logger.info(f"Welcome email SENT to {customer_email}")
+        else:
+            logger.warning(f"Welcome email FAILED for {customer_email} — queued for retry")
+    except ImportError:
+        logger.warning("key_delivery_daemon not available — key saved to pending delivery file")
+    except Exception as e:
+        logger.warning(f"Email delivery error: {e} — key saved to pending delivery file")
 
     return {"status": "key_generated", "tier": tier.value}
 
@@ -265,7 +287,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         payload = self.rfile.read(content_length)
         sig_header = self.headers.get("Stripe-Signature", "")
 
-        if STRIPE_WEBHOOK_SECRET and not verify_stripe_signature(
+        if not verify_stripe_signature(
             payload, sig_header, STRIPE_WEBHOOK_SECRET
         ):
             logger.warning("Rejected request with invalid signature")
@@ -326,7 +348,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("WEBHOOK_PORT", 8200))
     if not STRIPE_WEBHOOK_SECRET:
-        logger.warning("WARNING: STRIPE_WEBHOOK_SECRET not set - running in DEV mode")
+        logger.error("STRIPE_WEBHOOK_SECRET not set — webhook will REJECT all events. Configure this before deploying to production.")
 
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     logger.info(f"MEOK Stripe Webhook listening on port {port}")
